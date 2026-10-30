@@ -1,0 +1,48 @@
+#!/bin/sh
+# Refuses a push whose new commits name an author or committer other than this
+# clone's configured address (a commit made under another HOME falls back to
+# user@hostname), add a line naming this machine (login name, hostname), or fail
+# scripts/guard.sh. Enable once: git config core.hooksPath .githooks
+# Never bypass it with --no-verify; fix the change.
+
+want=$(git config user.email)
+[ -n "$want" ] || { echo "pre-push: no user.email configured; refusing" >&2; exit 1; }
+login=$(id -un 2>/dev/null)
+host=$(hostname -s 2>/dev/null)
+root=$(git rev-parse --show-toplevel)
+zero=0000000000000000000000000000000000000000
+status=0
+refuse() { echo "pre-push: refusing $local_ref: $1" >&2; status=1; }
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ "$local_sha" = "$zero" ] && continue
+  if [ "$remote_sha" = "$zero" ]; then range="$local_sha --not --remotes"; else range="$remote_sha..$local_sha"; fi
+  bad=$(git log --format='%h %ae %ce' $range | awk -v w="$want" '$2 != w || ($3 != w && $3 !~ /@users\.noreply\.github\.com$/)')
+  if [ -n "$bad" ]; then
+    refuse "commits with another identity (expected $want):"
+    echo "$bad" >&2
+    continue
+  fi
+  base=$(git merge-base "$local_sha" refs/remotes/origin/main 2>/dev/null)
+  if [ -z "$base" ]; then
+    if [ "$remote_sha" = "$zero" ]; then
+      # The first push of a new repository: judge every commit.
+      base=$(git hash-object -t tree /dev/null)
+    else
+      base=$remote_sha
+    fi
+  fi
+  [ "$base" = "$local_sha" ] && continue
+  added=$(git diff -U0 --no-color "$base" "$local_sha" | grep -E '^\+' | grep -vE '^\+\+\+ ')
+  hits=$(printf '%s\n' "$added" | awk -v login="$login" -v host="$host" '
+    { line = $0; why = ""
+      if (login != "" && index(line, login)) why = "login name"
+      else if (host != "" && index(tolower(line), tolower(host))) why = "hostname"
+      if (why != "") print why ": " substr(line, 1, 160) }')
+  if [ -n "$hits" ]; then
+    refuse "added lines name this machine:"
+    printf '%s\n' "$hits" | head -20 >&2
+  fi
+  sh "$root/scripts/guard.sh" "$base" "$local_sha" || status=1
+done
+exit $status
